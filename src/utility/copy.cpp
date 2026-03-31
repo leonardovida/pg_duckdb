@@ -29,10 +29,6 @@ extern "C" {
 #include "pgduckdb/pgduckdb_ruleutils.h"
 }
 
-static constexpr char s3_filename_prefix[] = "s3://";
-static constexpr char gcs_filename_prefix[] = "gs://";
-static constexpr char r2_filename_prefix[] = "r2://";
-
 /*
  * Returns the relation of the copy_stmt as a fully qualified DuckDB table reference. This is done
  * including the column names if provided in the original copy_stmt, e.g. my_table(column1, column2).
@@ -239,6 +235,27 @@ StringOneOfInternal(const char *str, const char *compare_to[], int length_of_com
 	return false;
 }
 
+bool
+MatchesURIScheme(const char *str) {
+	if (str == NULL) {
+		return false;
+	}
+
+	const char *p = str;
+
+	// First character must be a letter
+	if (!isalpha(*p))
+		return false;
+	p++;
+
+	// Continue with alphanumeric
+	while (*p && (isalnum(*p)))
+		p++;
+
+	// Must be followed by ://
+	return (strncmp(p, "://", 3) == 0);
+}
+
 #define StringOneOf(str, compare_to) StringOneOfInternal(str, compare_to, lengthof(compare_to))
 
 static bool
@@ -263,6 +280,11 @@ IsAllowedStatement(CopyStmt *stmt, bool throw_error = false) {
 
 	if (stmt->filename == NULL) {
 		elog(elevel, "COPY ... TO STDOUT/FROM STDIN is not supported by DuckDB");
+		return false;
+	}
+
+	if (!stmt->is_from && !is_absolute_path(stmt->filename) && !MatchesURIScheme(stmt->filename)) {
+		ereport(elevel, (errcode(ERRCODE_INVALID_NAME), errmsg("relative path not allowed for COPY to file")));
 		return false;
 	}
 
@@ -312,10 +334,15 @@ static bool
 NeedsDuckdbExecution(CopyStmt *stmt) {
 	/* Copy `filename` should start with S3/GS/R2 prefix */
 	if (stmt->filename != NULL) {
-		if (CheckPrefix(stmt->filename, s3_filename_prefix) || CheckPrefix(stmt->filename, gcs_filename_prefix) ||
-		    CheckPrefix(stmt->filename, r2_filename_prefix)) {
+		if (CheckPrefix(stmt->filename, "s3://") || CheckPrefix(stmt->filename, "r2://") ||
+		    CheckPrefix(stmt->filename, "gcs://") || CheckPrefix(stmt->filename, "gs://") ||
+		    CheckPrefix(stmt->filename, "http://") || CheckPrefix(stmt->filename, "https://") ||
+		    CheckPrefix(stmt->filename, "az://") || CheckPrefix(stmt->filename, "azure://") ||
+		    CheckPrefix(stmt->filename, "abfs://") || CheckPrefix(stmt->filename, "abfss://")) {
+
 			return true;
 		}
+
 		if (pg_str_endswith(stmt->filename, ".parquet") || pg_str_endswith(stmt->filename, ".json") ||
 		    pg_str_endswith(stmt->filename, ".ndjson") || pg_str_endswith(stmt->filename, ".jsonl") ||
 		    pg_str_endswith(stmt->filename, ".gz") || pg_str_endswith(stmt->filename, ".zst")) {

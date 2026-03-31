@@ -10,6 +10,9 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  */
 
+#include "duckdb/common/string.hpp"
+#include "duckdb/common/unordered_map.hpp"
+
 #include "pgduckdb/pgduckdb_ddl.hpp"
 
 extern "C" {
@@ -382,6 +385,16 @@ duckdb_estimate_rel_size(Relation /*rel*/, int32 *attr_widths, BlockNumber *page
  * ------------------------------------------------------------------------
  */
 
+#if PG_VERSION_NUM >= 180000
+
+static bool
+duckdb_scan_bitmap_next_tuple(TableScanDesc /*scan*/, TupleTableSlot * /*slot*/, bool * /*recheck*/,
+                              uint64 * /*lossy_pages*/, uint64 * /*exact_pages*/) {
+	NOT_IMPLEMENTED();
+}
+
+#else
+
 static bool
 duckdb_scan_bitmap_next_block(TableScanDesc /*scan*/, TBMIterateResult * /*tbmres*/) {
 	NOT_IMPLEMENTED();
@@ -391,6 +404,8 @@ static bool
 duckdb_scan_bitmap_next_tuple(TableScanDesc /*scan*/, TBMIterateResult * /*tbmres*/, TupleTableSlot * /*slot*/) {
 	NOT_IMPLEMENTED();
 }
+
+#endif
 
 static bool
 duckdb_scan_sample_next_block(TableScanDesc /*scan*/, SampleScanState * /*scanstate*/) {
@@ -467,8 +482,9 @@ static const TableAmRoutine duckdb_methods = {.type = T_TableAmRoutine,
                                               .relation_fetch_toast_slice = NULL,
 
                                               .relation_estimate_size = duckdb_estimate_rel_size,
-
+#if PG_VERSION_NUM < 180000
                                               .scan_bitmap_next_block = duckdb_scan_bitmap_next_block,
+#endif
                                               .scan_bitmap_next_tuple = duckdb_scan_bitmap_next_tuple,
                                               .scan_sample_next_block = duckdb_scan_sample_next_block,
                                               .scan_sample_next_tuple = duckdb_scan_sample_next_tuple};
@@ -479,9 +495,35 @@ duckdb_am_handler(FunctionCallInfo /*funcinfo*/) {
 }
 }
 
+static duckdb::unordered_map<const TableAmRoutine * /*am*/, duckdb::string /*name*/> duckdb_table_ams = {
+    {&duckdb_methods, "duckdb"}};
+
+extern "C" __attribute__((visibility("default"))) bool
+RegisterDuckdbTableAm(const char *name, const TableAmRoutine *am) {
+	return duckdb_table_ams.emplace(am, name).second;
+}
+
 namespace pgduckdb {
 bool
 IsDuckdbTableAm(const TableAmRoutine *am) {
 	return am == &duckdb_methods;
+}
+
+const char *
+DuckdbTableAmGetName(const TableAmRoutine *am) {
+	auto it = duckdb_table_ams.find(am);
+	return it == duckdb_table_ams.end() ? nullptr : it->second.c_str();
+}
+
+const char *
+DuckdbTableAmGetName(Oid relid) {
+	if (relid == InvalidOid) {
+		return nullptr;
+	}
+
+	auto rel = RelationIdGetRelation(relid);
+	const char *name = DuckdbTableAmGetName(rel->rd_tableam);
+	RelationClose(rel);
+	return name;
 }
 } // namespace pgduckdb

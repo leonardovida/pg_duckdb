@@ -2,6 +2,7 @@
 
 #include "pgduckdb/pgduckdb_planner.hpp"
 #include "pgduckdb/pg/transactions.hpp"
+#include "pgduckdb/pg/explain.hpp"
 #include "pgduckdb/pgduckdb_xact.hpp"
 #include "pgduckdb/pgduckdb_hooks.hpp"
 #include "pgduckdb/pgduckdb_utils.hpp"
@@ -65,14 +66,7 @@ ContainsCatalogTable(List *rtes) {
 
 static bool
 IsDuckdbTable(Oid relid) {
-	if (relid == InvalidOid) {
-		return false;
-	}
-
-	auto rel = RelationIdGetRelation(relid);
-	bool result = pgduckdb::IsDuckdbTableAm(rel->rd_tableam);
-	RelationClose(rel);
-	return result;
+	return pgduckdb::DuckdbTableAmGetName(relid) != nullptr;
 }
 
 static bool
@@ -149,6 +143,37 @@ namespace pgduckdb {
 int64_t executor_nest_level = 0;
 
 bool
+ContainsPostgresTable(Node *node, void *context) {
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, Query)) {
+		Query *query = (Query *)node;
+		List *rtable = query->rtable;
+		foreach_node(RangeTblEntry, rte, rtable) {
+			if (rte->relid == InvalidOid) {
+				continue;
+			}
+			if (!::IsDuckdbTable(rte->relid)) {
+				return true;
+			}
+		}
+
+#if PG_VERSION_NUM >= 160000
+		return query_tree_walker(query, ContainsPostgresTable, context, 0);
+#else
+		return query_tree_walker(query, (bool (*)())((void *)ContainsPostgresTable), context, 0);
+#endif
+	}
+
+#if PG_VERSION_NUM >= 160000
+	return expression_tree_walker(node, ContainsPostgresTable, context);
+#else
+	return expression_tree_walker(node, (bool (*)())((void *)ContainsPostgresTable), context);
+#endif
+}
+
+bool
 ShouldTryToUseDuckdbExecution(Query *query) {
 	if (top_level_duckdb_ddl_type == DDLType::REFRESH_MATERIALIZED_VIEW) {
 		/* When refreshing materialized views, we only want to use DuckDB
@@ -210,7 +235,7 @@ IsAllowedStatement(Query *query, bool throw_error) {
 		}
 	}
 
-	if (pgduckdb::executor_nest_level > 0) {
+	if (pgduckdb::executor_nest_level > 0 && !duckdb_unsafe_allow_execution_inside_functions) {
 		elog(elevel, "DuckDB execution is not supported inside functions");
 		return false;
 	}
@@ -237,10 +262,10 @@ DuckdbPlannerHook_Cpp(Query *parse, const char *query_string, int cursor_options
 			pgduckdb::TriggerActivity();
 			pgduckdb::IsAllowedStatement(parse, true);
 
-			return DuckdbPlanNode(parse, query_string, cursor_options, bound_params, true);
+			return DuckdbPlanNode(parse, cursor_options, true);
 		} else if (pgduckdb::ShouldTryToUseDuckdbExecution(parse)) {
 			pgduckdb::TriggerActivity();
-			PlannedStmt *duckdbPlan = DuckdbPlanNode(parse, query_string, cursor_options, bound_params, false);
+			PlannedStmt *duckdbPlan = DuckdbPlanNode(parse, cursor_options, false);
 			if (duckdbPlan) {
 				return duckdbPlan;
 			}
@@ -340,6 +365,7 @@ DuckdbExecutorStartHook(QueryDesc *queryDesc, int eflags) {
 	}
 
 	prev_executor_start_hook(queryDesc, eflags);
+
 	InvokeCPPFunc(DuckdbExecutorStartHook_Cpp, queryDesc);
 }
 
@@ -390,11 +416,8 @@ DuckdbExplainOneQueryHook(Query *query, int cursorOptions, IntoClause *into, Exp
 	 * EXPLAIN queries are also always re-planned (see
 	 * standard_ExplainOneQuery).
 	 */
-	duckdb_explain_analyze = es->analyze;
-	if (es->format == EXPLAIN_FORMAT_JSON)
-		duckdb_explain_format = duckdb::ExplainFormat::JSON;
-	else
-		duckdb_explain_format = duckdb::ExplainFormat::DEFAULT;
+	duckdb_explain_analyze = pgduckdb::pg::IsExplainAnalyze(es);
+	duckdb_explain_format = pgduckdb::pg::DuckdbExplainFormat(es);
 	duckdb_explain_ctas = into != NULL;
 	prev_explain_one_query_hook(query, cursorOptions, into, es, queryString, params, queryEnv);
 }

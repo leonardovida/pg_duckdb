@@ -6156,7 +6156,7 @@ get_target_list(List *targetList, deparse_context *context,
 		 * to the column name are still valid.
 		 */
 		if (!duckdb_skip_as && outermost_targetlist) {
-			Var *subscript_var = pgduckdb_duckdb_row_subscript_var(tle->expr);
+			Var *subscript_var = pgduckdb_duckdb_subscript_var(tle->expr);
 			if (subscript_var) {
 				/*
 				 * This cannot be moved to pgduckdb_ruleutils, because of
@@ -10134,11 +10134,6 @@ get_func_expr(FuncExpr *expr, deparse_context *context,
 		nargs++;
 	}
 
-	bool function_needs_subquery = pgduckdb_function_needs_subquery(funcoid);
-	if (function_needs_subquery) {
-		appendStringInfoString(buf, "(FROM ");
-	}
-
 	appendStringInfo(buf, "%s(",
 					 generate_function_name(funcoid, nargs,
 											argnames, argtypes,
@@ -10155,10 +10150,6 @@ get_func_expr(FuncExpr *expr, deparse_context *context,
 		get_rule_expr((Node *) lfirst(l), context, true);
 	}
 	appendStringInfoChar(buf, ')');
-
-	if (function_needs_subquery) {
-		appendStringInfoChar(buf, ')');
-	}
 }
 
 /*
@@ -11201,6 +11192,9 @@ get_from_clause_item(Node *jtnode, Query *query, deparse_context *context)
 				break;
 			case RTE_SUBQUERY:
 				/* Subquery RTE */
+				if (pgduckdb_replace_subquery_with_view(rte->subquery, buf)) {
+					break;
+				}
 				appendStringInfoChar(buf, '(');
 				get_query_def(rte->subquery, buf, context->namespaces, NULL,
 							  true,

@@ -3,9 +3,11 @@
 #include "duckdb/common/exception/conversion_exception.hpp"
 #include "duckdb/common/exception.hpp"
 
+#include "pgduckdb/pgduckdb_hooks.hpp"
 #include "pgduckdb/pgduckdb_planner.hpp"
 #include "pgduckdb/pgduckdb_types.hpp"
 #include "pgduckdb/vendor/pg_explain.hpp"
+#include "pgduckdb/pg/explain.hpp"
 
 extern "C" {
 #include "postgres.h"
@@ -192,7 +194,12 @@ ExecuteQuery(DuckdbScanState *state) {
 		named_values[duckdb::to_string(i + 1)] = duckdb::BoundParameterData(duckdb_param);
 	}
 
-	auto pending = prepared.PendingQuery(named_values, true);
+	// Set `allow_stream_result` to false if the query contains a Postgres table to force a fully materialized DuckDB
+	// result. This is required for cases like CTAS from a Postgres table, where allowing streaming results could lead
+	// to race conditions on Postgres resources.
+	// Checkout discussion: https://github.com/duckdb/pg_duckdb/discussions/866
+	bool allow_stream_result = !pgduckdb::ContainsPostgresTable((Node *)state->query, NULL);
+	auto pending = prepared.PendingQuery(named_values, allow_stream_result);
 	if (pending->HasError()) {
 		return pending->ThrowError();
 	}
@@ -222,7 +229,8 @@ ExecuteQuery(DuckdbScanState *state) {
 				do {
 					execution_result = pending->ExecuteTask();
 				} while (execution_result != duckdb::PendingExecutionResult::EXECUTION_ERROR &&
-				         execution_result != duckdb::PendingExecutionResult::NO_TASKS_AVAILABLE);
+				         execution_result != duckdb::PendingExecutionResult::NO_TASKS_AVAILABLE &&
+				         execution_result != duckdb::PendingExecutionResult::EXECUTION_FINISHED);
 
 				pending->Close();
 			} catch (std::exception &ex) {
@@ -363,11 +371,8 @@ Duckdb_ExplainCustomScan_Cpp(CustomScanState *node, ExplainState *es) {
 	 * the intended output. Since EXPLAIN EXECUTE is pretty rare for people to
 	 * run, we consider this fine for now.
 	 */
-	duckdb_explain_analyze = es->analyze;
-	if (es->format == EXPLAIN_FORMAT_JSON)
-		duckdb_explain_format = duckdb::ExplainFormat::JSON;
-	else
-		duckdb_explain_format = duckdb::ExplainFormat::DEFAULT;
+	duckdb_explain_analyze = pgduckdb::pg::IsExplainAnalyze(es);
+	duckdb_explain_format = pgduckdb::pg::DuckdbExplainFormat(es);
 
 	DuckdbScanState *duckdb_scan_state = (DuckdbScanState *)node;
 	ExecuteQuery(duckdb_scan_state);
@@ -399,7 +404,7 @@ Duckdb_ExplainCustomScan_Cpp(CustomScanState *node, ExplainState *es) {
 		appendStringInfoString(es->str, "\"DuckDB Execution Plan\": ");
 		formatDuckDbPlanForPG(value.c_str(), es);
 	} else
-		ExplainPropertyText("DuckDB Execution Plan", explain_output.str().c_str(), es);
+		pgduckdb::pg::ExplainPropertyText("DuckDB Execution Plan", explain_output.str().c_str(), es);
 }
 
 static inline void
